@@ -5,7 +5,8 @@
     "cache": {
       "enabled": true,
       "path": "/tmp/casino-ng-cache"
-    }
+    },
+    "analytics": "94301d67-4cd1-400d-a973-712bd075eb21"
   },
   "newProjectRoot": "projects",
   "projects": {

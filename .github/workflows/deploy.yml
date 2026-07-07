@@ -2,8 +2,8 @@ name: CI/CD casino-frontend -> ECR -> EKS
 
 on:
   push:
-    branches: [ deploy ]      # solo la rama deploy dispara el pipeline
-  workflow_dispatch:           # permite lanzarlo a mano desde la pestana Actions
+    branches: [ deploy ]
+  workflow_dispatch:
 
 env:
   AWS_REGION: us-east-1
@@ -12,60 +12,79 @@ env:
   DEPLOYMENT: casino-frontend
 
 jobs:
-  deploy:
+  # ============ STAGE 1: TEST (Angular + Chrome headless) ============
+  test:
     runs-on: ubuntu-latest
     steps:
-      - name: 1. Descargar el codigo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - name: Instalar Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Instalar dependencias
+        run: npm ci
+      - name: Ejecutar pruebas unitarias (Chrome headless)
+        run: npm test -- --watch=false --browsers=ChromeHeadless
 
-      - name: 2. Configurar credenciales AWS (temporales del lab)
+  # ============ STAGE 2: BUILD + PUSH a ECR ============
+  build:
+    needs: test                 # solo si test pasó
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configurar credenciales AWS
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
-
-      - name: 3. Login en Amazon ECR
+      - name: Login en ECR
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
-
-      - name: 4. Build y push con 3 tags (vX.Y.Z, latest, sha)
+      - name: Build y push (3 tags)
         env:
           REGISTRY: ${{ steps.ecr.outputs.registry }}
           SHA: ${{ github.sha }}
         run: |
           VERSION="v1.0.${{ github.run_number }}"
-          docker build \
-            -t "$REGISTRY/$ECR_REPOSITORY:$VERSION" \
-            -t "$REGISTRY/$ECR_REPOSITORY:latest" \
-            -t "$REGISTRY/$ECR_REPOSITORY:$SHA" .
+          docker build -t "$REGISTRY/$ECR_REPOSITORY:$VERSION" \
+                       -t "$REGISTRY/$ECR_REPOSITORY:latest" \
+                       -t "$REGISTRY/$ECR_REPOSITORY:$SHA" .
           docker push "$REGISTRY/$ECR_REPOSITORY:$VERSION"
           docker push "$REGISTRY/$ECR_REPOSITORY:latest"
           docker push "$REGISTRY/$ECR_REPOSITORY:$SHA"
 
-      - name: 5. Instalar kubectl
+  # ============ STAGE 3: DEPLOY a EKS ============
+  deploy:
+    needs: build                # solo si build pasó
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configurar credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Login en ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Instalar kubectl
         run: |
           curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
           chmod +x kubectl && sudo mv kubectl /usr/local/bin/kubectl
-
-      - name: 6. Conectar kubectl al cluster
+      - name: Conectar al cluster
         run: aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION"
-
-      - name: 7. Desplegar en EKS
+      - name: Deploy en EKS
         env:
           REGISTRY: ${{ steps.ecr.outputs.registry }}
           SHA: ${{ github.sha }}
         run: |
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          # Primera vez: crea Deployment y Service sustituyendo los marcadores.
           sed -i "s|<ACCOUNT_ID>|$ACCOUNT_ID|g; s|<REGION>|$AWS_REGION|g" k8s/deployment.yaml
           kubectl apply -f k8s/deployment.yaml
           kubectl apply -f k8s/service.yaml
-          # Actualiza la imagen al SHA exacto de este commit (trazabilidad).
-          kubectl set image deployment/$DEPLOYMENT \
-            $DEPLOYMENT="$REGISTRY/$ECR_REPOSITORY:$SHA"
+          kubectl set image deployment/$DEPLOYMENT $DEPLOYMENT="$REGISTRY/$ECR_REPOSITORY:$SHA"
           kubectl rollout status deployment/$DEPLOYMENT --timeout=180s
-
-      - name: 8. Mostrar estado
-        run: kubectl get pods -l app=$DEPLOYMENT -o wide
